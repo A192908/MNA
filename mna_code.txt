@@ -1,0 +1,180 @@
+%GETDSN(MSS-P1-PCA-06);
+
+PROC SQL;
+
+	CONNECT TO &SQLEng(
+	noprompt="DSN=&SQLServer;
+	Server=MSS-P1-PCA-06;
+	DATABASE=FSSCorecard;"
+	read_isolation_level=RU);
+	CREATE table req AS
+	SELECT *
+	FROM CONNECTION TO &SQLEng
+(
+SELECT
+	CAST(insertdate AS date) AS sendate,
+	PolicyNumber,
+	TestControl
+
+FROM IntelliCheckStaging.Email.CLBIEmailCampaigns as a with (nolock)
+WHERE
+    subcampaignname = 'Marketing_Mobile_App_Fulfill_CL'
+    and CAST(insertdate AS date) >= '2023-01-01'
+GROUP BY
+	cast(insertdate AS date),
+	PolicyNumber,
+	TestControl
+);QUIT;
+
+/*Policy dataset*/
+
+PROC SQL;
+	CONNECT TO ODBC AS CONN (%db2conn(dsn=DB2P));
+	CREATE TABLE Policy AS
+	SELECT * FROM CONNECTION TO CONN
+		(
+		SELECT DISTINCT
+			policy.POL_ID_CHAR AS pol_number,
+			policy.RENW_CNT AS term_number,
+			pol_date.POL_EFF_DT AS start_date,
+			pol_date.POL_STOP_DT AS stop_date,
+			DATE(DAYS(pol_date.POL_EFF_DT) + 7) AS day7,
+	
+			CASE 
+				WHEN pol_date.POL_STOP_DT > DATE(DAYS(pol_date.POL_EFF_DT) + 97) THEN 'true'
+				ELSE 'false'
+			END AS ret90,
+			
+			RMM.DSTRBT_CHNL AS Channel,
+    			BMT.BMT ,
+    			BMT.BUS_TYP_DESC,
+			CAWCohortStop
+
+		FROM CAW.POLICY AS policy
+			inner join caw.pol_dates pd 
+        		on pd.POL_KEY_CHAR=policy.POL_KEY_CHAR 
+    			inner join CAW.BUSTYP BMT 
+        		on POLICY.SIC_CD = BMT.CV_INDSTR_CLSS_CD
+    			inner join CAW.RT_MAN_MDL RMM 
+        		on POLICY.RT_MAN_CD = RMM.RT_MAN_CD 
+  			left join dse.pol AS dse
+    			on right(policy.COH_ID_CHAR,11) = left(dse.COHRT_REF_NBR, 11) /* This is used because policynumbers are re-used */
+    			and dse.PROD_CD  = 'CA'
+  			inner join
+  			( /* table CAWCoh : Cohort stop dates are on a term level so need to get the max */
+    			select
+      			policy.COH_ID_CHAR,
+      			max(pd.POL_STOP_DT) AS CAWCohortStop
+    			FROM caw.policy AS policy
+        		inner join caw.pol_dates AS  pd 
+            		on pd.POL_KEY_CHAR=policy.POL_KEY_CHAR 
+    			where
+        		pd.POL_STOP_DT >= '2023-08-01' /* start date of the test. Policy was in force at the time of treatment.  Increase performance of query */
+    			group by 
+      			policy.COH_ID_CHAR
+  			) AS CAWCoh
+    			on policy.COH_ID_CHAR = CAWCoh.COH_ID_CHAR
+
+		WHERE DATE(DAYS(pol_date.POL_EFF_DT) + 7) >= '2023-01-01'
+			AND policy.RENW_CNT = 0);
+QUIT;
+
+
+proc sql;
+create table RetentionOutput as
+select distinct a.*, b.*,
+	case when INTNX('day',b.senddate, 30, 'same') >= today() then 'x'
+		when a.CAWCohortStop >= intnx('day', b.senddate, 30, 'same') then '1'
+		else '0' end
+		as CAWret30,
+	case when INTNX('day',b.senddate, 60, 'same') >= today() then 'x'
+		when a.CAWCohortStop >= intnx('day', b.senddate, 60, 'same') then '1'
+		else '0' end
+		as CAWret60,
+	case when INTNX('day',b.senddate, 90, 'same') >= today() then 'x'
+		when a.CAWCohortStop >= intnx('day', b.senddate, 90, 'same')then '1'
+		else '0' end
+		as CAWret90
+ from req as b
+	join Policy as a
+		on cats(repeat("0",20-lengthn(compress(a.pol_number))),compress(a.pol_number))
+			= cats(repeat("0",20-lengthn(compress(b.PolicyNumber))),compress(b.PolicyNumber)) 
+		/* this forces policynumber to be 20 characters long with 0s padding so that '0123' will join with '00123' 
+		   can also use put() here to convert if policynumber is numeric*/
+		and b.senddate between a.start_date and a.stop_date /* use the term that the treatment occurred on. Policy may have renewed during the test period */
+;quit;
+
+/*MNA Logins*/
+
+PROC SQL;
+%sf_ref_acs_tok
+CREATE TABLE logins AS SELECT * FROM CONNECTION TO odbc
+(select distinct
+      P.PolicyNbr as pol_id_char,
+      C.PartitionDate as LoginDate
+from
+    deal.Published.VW_FactSiteHit C
+    inner join deal.published.VW_XrefSiteHitPolicy P on C.FactSiteHitId = P.FactSiteHitId 
+where
+    C.SourceDomainName = 'MNA'
+    and cast(C.PartitionDate as date) >= '2023-01-01'
+    and P.ProductName = 'CA'
+
+);
+QUIT;
+
+%sf_ref_acs_tok
+create table eml as
+select * from connection to odbc
+(
+select 
+    agreementnumber as policynumber,
+    cast(ds.senddatetime as date) as EmailSendDate,
+  max(case when fe.openind = 1 or fe.clickind = 1 then 1 else 0 end) as OpenInd,
+  max(case when fe.clickind = 1 then 1 else 0 end) as ClickInd
+from SALESFORCE_MKT_EMAIL.PUBLISHED.VW_DIMEMAILSEND as ds
+  join SALESFORCE_MKT_EMAIL.PUBLISHED.VW_DIMEMAILCAMPAIGN as ca
+    on ds.dimemailcampaignid = ca.dimemailcampaignid
+  join SALESFORCE_MKT_EMAIL.PUBLISHED.VW_FACTEMAILEVENT as fe
+    on ds.dimemailsendid = fe.dimemailsendid
+where
+  ds.senddatetime >= '2023-01-01'
+  and ca.EmailCampaignName = 'Marketing_Mobile_App_Fulfill_CL'
+group by
+    agreementnumber,
+    cast(ds.senddatetime as date)
+);
+quit;
+
+/*Join the tables*/
+
+PROC SQL;
+CREATE TABLE final_output AS
+SELECT DISTINCT ro.POL_NUMBER, ro.TERM_NUMBER, ro.START_DATE,
+
+MAX(CASE
+               WHEN l.LoginDate IS NOT NULL THEN 1
+               ELSE 0
+           END) AS loginStatus,
+
+CASE 
+	WHEN ro.senddate IS NOT NULL THEN 1
+		ELSE 0
+END AS sendStatus,
+
+CASE
+	WHEN l.LoginDate IS NOT NULL AND ro.CAWret90 = '1' THEN 1
+	ELSE 0
+END AS login_retained,
+
+CASE
+	WHEN l.LoginDate IS NULL AND ro.CAWret90 = '1' THEN 1
+	ELSE 0
+END AS no_login_retained
+
+FROM RetentionOutput AS ro
+LEFT JOIN logins AS l ON ro.pol_number = l.pol_id_char
+        AND l.LoginDate BETWEEN ro.senddate AND INTNX('day', ro.senddate, 6, 'same')
+LEFT JOIN eml AS e ON ro.POL_NUMBER = e.policynumber
+GROUP BY ro.POL_NUMBER;
+QUIT;
